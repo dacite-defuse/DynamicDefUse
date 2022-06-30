@@ -1,8 +1,10 @@
 package instrumentation;
 
-import com.sun.tools.classfile.Opcode;
+import org.objectweb.asm.Opcodes;
 import defuse.ParameterCollector;
-import org.objectweb.asm.*;
+import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.*;
 
 
@@ -13,17 +15,17 @@ import java.io.OutputStream;
 import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.IllegalClassFormatException;
 import java.security.ProtectionDomain;
-import java.util.ArrayList;
 import java.util.Iterator;
 
 public class Transformer implements ClassFileTransformer {
 
+	private String dir;
+
 	@Override
 	public byte[] transform(ClassLoader loader, String className, Class<?> classBeingRedefined,
 			ProtectionDomain protectionDomain, byte[] classfileBuffer) throws IllegalClassFormatException {
-
 		Thread th = Thread.currentThread();
-		if (className.startsWith("execution/")) {
+		if (className.startsWith(dir)) {
 
 			ClassReader reader = new ClassReader(classfileBuffer);
 			ClassNode node = new ClassNode();
@@ -37,43 +39,24 @@ public class Transformer implements ClassFileTransformer {
 				if (mnode.name.equals("<init>")) {
 					//continue;
 				}
-				// Register method Parameter for DefUse by aligning first local variables with parameter types
-				InsnList methodStart = new InsnList();
-				Type[] types = Type.getArgumentTypes(mnode.desc);
-				int typeindex = 0;
-				for(int i =0; i< mnode.localVariables.size()*2; i++) {
-					if (mnode.localVariables.size() < i || typeindex >= types.length) {
-						break;
-					}
-					LocalVariableNode localVariable = null;
-					for(LocalVariableNode lv: mnode.localVariables){
-						if(lv.index == i){
-							localVariable = lv;
-							break;
-						}
-					}
-
-					if (localVariable != null && Type.getType(localVariable.desc).equals(types[typeindex])) {
-						boxing(types[typeindex], localVariable.index, methodStart, true);
-						methodStart.add(new IntInsnNode(Opcodes.BIPUSH, localVariable.index));
-						methodStart.add(new LdcInsnNode(mnode.name));
-						methodStart.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "defuse/DefUseAnalyser", "visitParameter", "(Ljava/lang/Object;ILjava/lang/String;)V", false));
-						if(types[typeindex] == Type.DOUBLE_TYPE || types[typeindex] == Type.LONG_TYPE){
-							i++;
-						}
-						typeindex++;
-					}
-				}
 
 				AbstractInsnNode firstIns = insns.getFirst();
 				Iterator<AbstractInsnNode> j = insns.iterator();
 				int index = 0;
+				int firstLinenumber = 0;
 				while (j.hasNext()) {
 					AbstractInsnNode in = j.next();
 					int op = in.getOpcode();
 					if (in instanceof VarInsnNode) {
 						VarInsnNode varins = (VarInsnNode) in;
-						InsnList il = instrumentVarInsn(varins, mnode.name, op, linenumber, index);
+						String varname = "";
+						for(LocalVariableNode lvariable :mnode.localVariables){
+							if(lvariable.index == varins.var){
+								varname = lvariable.name;
+								break;
+							}
+						}
+						InsnList il = instrumentVarInsn(varins, mnode.name, varname, op, linenumber, index);
 						index++;
 						if(il != null){
 							insns.insert(in, il);
@@ -100,30 +83,71 @@ public class Transformer implements ClassFileTransformer {
 					} else if(in instanceof IincInsnNode){
 						IincInsnNode incIns = (IincInsnNode) in;
 						InsnList il = new InsnList();
+						String varname = "";
+						for(LocalVariableNode lvariable :mnode.localVariables){
+							if(lvariable.index == incIns.var){
+								varname = lvariable.name;
+								break;
+							}
+						}
 						boxing(Type.INT_TYPE, incIns.var, il, true);
 						il.add(new IntInsnNode(Opcodes.BIPUSH, incIns.var));
 						il.add(new IntInsnNode(Opcodes.BIPUSH, linenumber));
 						il.add(new IntInsnNode(Opcodes.BIPUSH, index));
 						il.add(new LdcInsnNode(mnode.name));
-						il.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "defuse/DefUseAnalyser", "visitUse", "(Ljava/lang/Object;IIILjava/lang/String;)V", false));
+						il.add(new LdcInsnNode(varname));
+						il.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "defuse/DefUseAnalyser", "visitUse", "(Ljava/lang/Object;IIILjava/lang/String;Ljava/lang/String;)V", false));
 						insns.insertBefore(in, il);
 						boxing(Type.INT_TYPE, incIns.var, il, true);
 						il.add(new IntInsnNode(Opcodes.BIPUSH, incIns.var));
 						il.add(new IntInsnNode(Opcodes.BIPUSH, linenumber));
 						il.add(new IntInsnNode(Opcodes.BIPUSH, index));
 						il.add(new LdcInsnNode(mnode.name));
-						il.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "defuse/DefUseAnalyser", "visitDef", "(Ljava/lang/Object;IIILjava/lang/String;)V", false));
+						il.add(new LdcInsnNode(varname));
+						il.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "defuse/DefUseAnalyser", "visitDef", "(Ljava/lang/Object;IIILjava/lang/String;Ljava/lang/String;)V", false));
 						insns.insert(in, il);
 						index++;
 					} else if(in instanceof LineNumberNode){
 						LineNumberNode lineins = (LineNumberNode) in;
 						linenumber = lineins.line;
+						if(firstLinenumber == 0){
+							firstLinenumber = linenumber-1;
+						}
 					} else if(in instanceof MethodInsnNode) {
 						MethodInsnNode methodins = (MethodInsnNode) in;
 						InsnList il = instrumentMethodInsn(methodins, mnode, linenumber);
 						if(il != null){
 							insns.insertBefore(in, il);
 						}
+					}
+				}
+				// Register method Parameter for DefUse by aligning first local variables with parameter types
+				InsnList methodStart = new InsnList();
+				Type[] types = Type.getArgumentTypes(mnode.desc);
+				int typeindex = 0;
+				for(int i =0; i< mnode.localVariables.size()*2; i++) {
+					if (mnode.localVariables.size() < i || typeindex >= types.length) {
+						break;
+					}
+					LocalVariableNode localVariable = null;
+					for(LocalVariableNode lv: mnode.localVariables){
+						if(lv.index == i){
+							localVariable = lv;
+							break;
+						}
+					}
+
+					if (localVariable != null && Type.getType(localVariable.desc).equals(types[typeindex])) {
+						boxing(types[typeindex], localVariable.index, methodStart, true);
+						methodStart.add(new IntInsnNode(Opcodes.BIPUSH, localVariable.index));
+						methodStart.add(new IntInsnNode(Opcodes.BIPUSH, firstLinenumber));
+						methodStart.add(new LdcInsnNode(mnode.name));
+						methodStart.add(new LdcInsnNode(localVariable.name));
+						methodStart.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "defuse/DefUseAnalyser", "visitParameter", "(Ljava/lang/Object;IILjava/lang/String;Ljava/lang/String;)V", false));
+						if(types[typeindex] == Type.DOUBLE_TYPE || types[typeindex] == Type.LONG_TYPE){
+							i++;
+						}
+						typeindex++;
 					}
 				}
 				insns.insertBefore(firstIns, methodStart);
@@ -236,7 +260,7 @@ public class Transformer implements ClassFileTransformer {
 	 * @param linenumber current linenumber of source code
 	 * @return instrumented instructions
 	 */
-	protected InsnList instrumentVarInsn(VarInsnNode varins, String methodName, int op, int linenumber, int index){
+	protected InsnList instrumentVarInsn(VarInsnNode varins, String methodName, String variableName, int op, int linenumber, int index){
 		if((op == Opcodes.ILOAD || op == Opcodes.LLOAD || op == Opcodes.FLOAD ||
 				op == Opcodes.DLOAD || (op == Opcodes.ALOAD && !methodName.equals("<init>")) ||
 				op == Opcodes.ISTORE || op == Opcodes.LSTORE || op == Opcodes.FSTORE ||
@@ -248,11 +272,12 @@ public class Transformer implements ClassFileTransformer {
 			il.add(new IntInsnNode(Opcodes.BIPUSH, linenumber));
 			il.add(new IntInsnNode(Opcodes.BIPUSH, index));
 			il.add(new LdcInsnNode(methodName));
+			il.add(new LdcInsnNode(variableName));
 			if (op == Opcodes.ILOAD || op == Opcodes.LLOAD || op == Opcodes.FLOAD ||
 					op == Opcodes.DLOAD || op == Opcodes.ALOAD) {
-				il.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "defuse/DefUseAnalyser", "visitUse", "(Ljava/lang/Object;IIILjava/lang/String;)V", false));
+				il.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "defuse/DefUseAnalyser", "visitUse", "(Ljava/lang/Object;IIILjava/lang/String;Ljava/lang/String;)V", false));
 			} else {
-				il.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "defuse/DefUseAnalyser", "visitDef", "(Ljava/lang/Object;IIILjava/lang/String;)V", false));
+				il.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "defuse/DefUseAnalyser", "visitDef", "(Ljava/lang/Object;IIILjava/lang/String;Ljava/lang/String;)V", false));
 			}
 			return il;
 		}
@@ -376,17 +401,18 @@ public class Transformer implements ClassFileTransformer {
 			} else {
 				il.add(new InsnNode(Opcodes.DUP));
 			}
-			boxing(varType, 0, il, true);
-			il.add(new LdcInsnNode(fieldins.owner+"."+fieldins.name));
+			boxing(varType, 0, il, false);
+			il.add(new LdcInsnNode(fieldins.name));
 			il.add(new IntInsnNode(Opcodes.BIPUSH, linenumber));
 			il.add(new IntInsnNode(Opcodes.BIPUSH, index));
 			il.add(new LdcInsnNode(methodName));
+			il.add(new LdcInsnNode(fieldins.owner));
 			if(op == Opcodes.GETSTATIC){
-				il.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "defuse/DefUseAnalyser", "visitStaticFieldUse", "(Ljava/lang/Object;Ljava/lang/String;IILjava/lang/String;)V", false));
+				il.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "defuse/DefUseAnalyser", "visitStaticFieldUse", "(Ljava/lang/Object;Ljava/lang/String;IILjava/lang/String;Ljava/lang/String;)V", false));
 				output[1] = il;
 			} else {
 				// Putfield needs instrumentation before instruction otherwise value is no longer on stack
-				il.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "defuse/DefUseAnalyser", "visitStaticFieldDef", "(Ljava/lang/Object;Ljava/lang/String;IILjava/lang/String;)V", false));
+				il.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "defuse/DefUseAnalyser", "visitStaticFieldDef", "(Ljava/lang/Object;Ljava/lang/String;IILjava/lang/String;Ljava/lang/String;)V", false));
 				output[0] = il;
 			}
 		} else if(op == Opcodes.PUTFIELD){
@@ -469,5 +495,9 @@ public class Transformer implements ClassFileTransformer {
 			return il;
 		}
 		return null;
+	}
+
+	public void setDir(String dir){
+		this.dir = dir;
 	}
 }
